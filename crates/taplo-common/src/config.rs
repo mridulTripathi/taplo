@@ -15,6 +15,8 @@ use crate::{
     util::{GlobRule, Normalize},
     HashMap,
 };
+#[cfg(feature = "schema")]
+use crate::schema::security::SchemaSecurityConfig;
 
 pub const CONFIG_FILE_NAMES: &[&str] = &[".taplo.toml", "taplo.toml"];
 
@@ -47,6 +49,11 @@ pub struct Config {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rule: Vec<Rule>,
+
+    /// Security configuration for schema loading
+    #[cfg(feature = "schema")]
+    #[serde(default)]
+    pub schema_security: SchemaSecurityConfig,
 
     #[serde(flatten)]
     pub global_options: Options,

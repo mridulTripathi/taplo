@@ -1,0 +1,87 @@
+# Example taplo.toml configuration with schema security settings
+# This file demonstrates how to configure secure schema loading
+
+# Schema security configuration
+[schema_security]
+# Maximum allowed schema size in bytes (1MB)
+max_schema_size = 1048576
+
+# Maximum recursion depth for schema references
+max_recursion_depth = 5
+
+# Maximum time allowed for schema resolution (30 seconds)
+resolution_timeout = 30
+
+# Maximum concurrent schema requests
+max_concurrent_requests = 3
+
+# Allowed URL schemes (only HTTPS by default)
+allowed_schemes = ["https"]
+
+# Allowed URL patterns (glob patterns)
+allowed_urls = [
+    "https://json.schemastore.org/**",
+    "https://raw.githubusercontent.com/**",
+    "https://schemas.example.com/**"
+]
+
+# Blocked URL patterns (glob patterns)
+blocked_urls = [
+    "http://**",
+    "ftp://**",
+    "file://**",
+    "https://malicious-site.com/**"
+]
+
+# Allowed file paths (relative to workspace)
+allowed_file_paths = [
+    "schemas/",
+    ".schemas/",
+    "config/schemas/"
+]
+
+# Blocked file paths (relative to workspace)
+blocked_file_paths = [
+    "/",
+    "/etc",
+    "/var",
+    "/tmp",
+    "/home"
+]
+
+# Whether to allow localhost/internal network access
+allow_localhost = false
+
+# Whether to allow file:// scheme access
+allow_file_scheme = false
+
+# Whether to validate schema integrity (hash/signature)
+validate_integrity = true
+
+# Whether to enable audit logging
+audit_logging = true
+
+# Example of a more restrictive configuration for production environments
+# [schema_security.production]
+# max_schema_size = 512000  # 500KB
+# max_recursion_depth = 3
+# resolution_timeout = 15
+# max_concurrent_requests = 2
+# allowed_urls = [
+#     "https://json.schemastore.org/**"
+# ]
+# allow_file_scheme = false
+# validate_integrity = true
+# audit_logging = true
+
+# Example of a more permissive configuration for development
+# [schema_security.development]
+# max_schema_size = 2097152  # 2MB
+# max_recursion_depth = 15
+# resolution_timeout = 60
+# max_concurrent_requests = 10
+# allowed_schemes = ["https", "http"]
+# allow_localhost = true
+# allow_file_scheme = true
+# validate_integrity = false
+# audit_logging = false

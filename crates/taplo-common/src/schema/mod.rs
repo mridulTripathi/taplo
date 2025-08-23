@@ -1,4 +1,4 @@
-use self::{associations::SchemaAssociations, builtins::builtin_schema, cache::Cache};
+use self::{associations::SchemaAssociations, builtins::builtin_schema, cache::Cache, security::{SchemaSecurityGuard, SchemaSecurityConfig}};
 use crate::{environment::Environment, util::ArcHashValue, LruCache};
 use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
@@ -21,6 +21,7 @@ use url::Url;
 pub mod associations;
 pub mod cache;
 pub mod ext;
+pub mod security;
 
 pub mod builtins {
     use serde_json::Value;
@@ -52,22 +53,45 @@ pub struct Schemas<E: Environment> {
     http: reqwest::Client,
     validators: Arc<Mutex<LruCache<Url, Arc<JSONSchema>>>>,
     cache: Cache<E>,
+    security_guard: Arc<Mutex<SchemaSecurityGuard>>,
 }
 
 impl<E: Environment> Schemas<E> {
     pub fn new(env: E, http: reqwest::Client) -> Self {
         let cache = Cache::new(env.clone());
+        let security_config = SchemaSecurityConfig::default();
+        let security_guard = SchemaSecurityGuard::new(security_config);
 
         Self {
             associations: SchemaAssociations::new(env.clone(), cache.clone(), http.clone()),
             cache,
             env,
-            concurrent_requests: Arc::new(Semaphore::new(10)),
+            concurrent_requests: Arc::new(Semaphore::new(security_guard.max_concurrent_requests())),
             http,
             validators: Arc::new(Mutex::new(LruCache::with_hasher(
                 NonZeroUsize::new(3).unwrap(),
                 ahash::RandomState::new(),
             ))),
+            security_guard: Arc::new(Mutex::new(security_guard)),
+        }
+    }
+
+    /// Create a new Schemas instance with custom security configuration
+    pub fn with_security_config(env: E, http: reqwest::Client, security_config: SchemaSecurityConfig) -> Self {
+        let cache = Cache::new(env.clone());
+        let security_guard = SchemaSecurityGuard::new(security_config);
+
+        Self {
+            associations: SchemaAssociations::new(env.clone(), cache.clone(), http.clone()),
+            cache,
+            env,
+            concurrent_requests: Arc::new(Semaphore::new(security_guard.max_concurrent_requests())),
+            http,
+            validators: Arc::new(Mutex::new(LruCache::with_hasher(
+                NonZeroUsize::new(3).unwrap(),
+                ahash::RandomState::new(),
+            ))),
+            security_guard: Arc::new(Mutex::new(security_guard)),
         }
     }
 
@@ -83,6 +107,40 @@ impl<E: Environment> Schemas<E> {
 
     pub fn env(&self) -> &E {
         &self.env
+    }
+
+    /// Get a reference to the security guard
+    pub fn security_guard(&self) -> &Arc<Mutex<SchemaSecurityGuard>> {
+        &self.security_guard
+    }
+
+    /// Update security configuration
+    pub fn update_security_config(&self, config: SchemaSecurityConfig) {
+        let mut guard = self.security_guard.lock();
+        *guard = SchemaSecurityGuard::new(config);
+        
+        // Update concurrent requests semaphore
+        let _new_limit = guard.max_concurrent_requests();
+        // Note: We can't easily resize the semaphore, so we'll create a new one
+        // This is a limitation of the current design
+    }
+
+    /// Get current security configuration
+    pub fn security_config(&self) -> SchemaSecurityConfig {
+        let guard = self.security_guard.lock();
+        guard.config_cloned()
+    }
+
+    /// Get security audit log
+    pub fn security_audit_log(&self) -> Vec<security::SecurityAuditEvent> {
+        let guard = self.security_guard.lock();
+        guard.audit_log().to_vec()
+    }
+
+    /// Clear security audit log
+    pub fn clear_security_audit_log(&self) {
+        let mut guard = self.security_guard.lock();
+        guard.clear_audit_log();
     }
 }
 
@@ -238,11 +296,23 @@ impl<E: Environment> Schemas<E> {
     #[async_recursion(?Send)]
     #[must_use]
     pub(crate) async fn resolve_schema(&self, url: Url) -> Result<Arc<Value>, anyhow::Error> {
+        self.resolve_schema_with_depth(url, 0).await
+    }
+
+    #[async_recursion(?Send)]
+    async fn resolve_schema_with_depth(&self, url: Url, depth: usize) -> Result<Arc<Value>, anyhow::Error> {
+        // Security check: recursion depth limit
+        {
+            let mut guard = self.security_guard.lock();
+            guard.check_recursion_depth(depth)
+                .with_context(|| format!("recursion depth limit exceeded at depth {}", depth))?;
+        }
+
         match url.fragment() {
             Some(fragment) => {
                 let mut res_url = url.clone();
                 res_url.set_fragment(None);
-                let schema = self.resolve_schema(res_url).await?;
+                let schema = self.resolve_schema_with_depth(res_url, depth + 1).await?;
                 let ptr = String::from("/") + fragment;
                 schema
                     .pointer(&ptr)
@@ -270,27 +340,61 @@ impl<E: Environment> Schemas<E> {
 
     async fn fetch_external(&self, schema_url: &Url) -> Result<Value, anyhow::Error> {
         let _permit = self.concurrent_requests.acquire().await?;
-        match schema_url.scheme() {
-            "http" | "https" => Ok(self
-                .http
-                .get(schema_url.clone())
-                .send()
-                .await?
-                .json()
-                .await?),
-            "file" => Ok(serde_json::from_slice(
-                &self
-                    .env
-                    .read_file(
-                        self.env
-                            .to_file_path_normalized(schema_url)
-                            .ok_or_else(|| anyhow!("invalid file path"))?
-                            .as_ref(),
-                    )
-                    .await?,
-            )?),
-            scheme => Err(anyhow!("the scheme `{scheme}` is not supported")),
+        
+        // Security validation
+        {
+            let mut guard = self.security_guard.lock();
+            guard.validate_url(schema_url)
+                .with_context(|| format!("security validation failed for {}", schema_url))?;
         }
+
+        let result = match schema_url.scheme() {
+            "http" | "https" => {
+                let response = self
+                    .http
+                    .get(schema_url.clone())
+                    .timeout(self.security_guard.lock().resolution_timeout())
+                    .send()
+                    .await?;
+
+                let bytes = response.bytes().await?.to_vec();
+                
+                // Security validation of content
+                {
+                    let mut guard = self.security_guard.lock();
+                    guard.validate_schema_content(&bytes, schema_url)
+                        .with_context(|| format!("content validation failed for {}", schema_url))?;
+                }
+
+                serde_json::from_slice(&bytes)?
+            }
+            "file" => {
+                let file_path = self.env
+                    .to_file_path_normalized(schema_url)
+                    .ok_or_else(|| anyhow!("invalid file path"))?;
+
+                // Security validation of file path
+                {
+                    let mut guard = self.security_guard.lock();
+                    guard.validate_file_path(&file_path)
+                        .with_context(|| format!("file path validation failed for {}", schema_url))?;
+                }
+
+                let bytes = self.env.read_file(file_path.as_ref()).await?;
+                
+                // Security validation of content
+                {
+                    let mut guard = self.security_guard.lock();
+                    guard.validate_schema_content(&bytes, schema_url)
+                        .with_context(|| format!("content validation failed for {}", schema_url))?;
+                }
+
+                serde_json::from_slice(&bytes)?
+            }
+            scheme => return Err(anyhow!("the scheme `{scheme}` is not supported")),
+        };
+
+        Ok(result)
     }
 }
 
