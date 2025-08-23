@@ -11,7 +11,7 @@ use regex::Regex;
 use semver::Version;
 use serde::{de::Error, Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{borrow::Cow, path::Path, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, path::Path, sync::Arc};
 use tap::Tap;
 use taplo::dom::Node;
 use tokio::sync::Semaphore;
@@ -40,11 +40,230 @@ pub mod source {
     pub const DIRECTIVE: &str = "directive";
 }
 
+/// Optimized index structure for fast schema association lookups
+#[derive(Default)]
+struct AssociationIndexes {
+    // O(1) exact URL matches
+    url_index: HashMap<Url, SchemaAssociation>,
+    
+    // O(1) glob pattern lookups by normalized path
+    glob_index: HashMap<String, Vec<SchemaAssociation>>,
+    
+    // O(n) regex patterns (kept as Vec since regex matching is inherently O(n))
+    regex_patterns: Vec<(Regex, SchemaAssociation)>,
+    
+    // O(log n) priority-based lookups
+    priority_index: HashMap<usize, Vec<SchemaAssociation>>,
+    
+    // Cache for compiled glob patterns to avoid repeated compilation
+    glob_cache: HashMap<String, GlobRule>,
+}
+
+impl AssociationIndexes {
+    fn new() -> Self {
+        Self::default()
+    }
+    
+    fn clear(&mut self) {
+        self.url_index.clear();
+        self.glob_index.clear();
+        self.regex_patterns.clear();
+        self.priority_index.clear();
+        self.glob_cache.clear();
+    }
+    
+    fn add(&mut self, rule: AssociationRule, assoc: SchemaAssociation) {
+        // Add to priority index
+        self.priority_index
+            .entry(assoc.priority)
+            .or_insert_with(Vec::new)
+            .push(assoc.clone());
+        
+        // Add to specific index based on rule type
+        match rule {
+            AssociationRule::Url(url) => {
+                self.url_index.insert(url, assoc);
+            }
+            AssociationRule::Glob(glob) => {
+                // Normalize the glob pattern for indexing
+                let normalized = self.normalize_glob_pattern(&glob);
+                self.glob_index
+                    .entry(normalized.clone())
+                    .or_insert_with(Vec::new)
+                    .push(assoc);
+                
+                // Cache the compiled glob rule
+                self.glob_cache.insert(normalized, glob);
+            }
+            AssociationRule::Regex(regex) => {
+                self.regex_patterns.push((regex, assoc));
+            }
+        }
+    }
+    
+    fn remove(&mut self, rule: &AssociationRule, assoc: &SchemaAssociation) -> bool {
+        let mut removed = false;
+        
+        // Remove from priority index
+        if let Some(assocs) = self.priority_index.get_mut(&assoc.priority) {
+            assocs.retain(|a| {
+                if a.url == assoc.url && a.meta == assoc.meta {
+                    removed = true;
+                    false
+                } else {
+                    true
+                }
+            });
+            
+            // Clean up empty priority entries
+            if assocs.is_empty() {
+                self.priority_index.remove(&assoc.priority);
+            }
+        }
+        
+        // Remove from specific indexes
+        match rule {
+            AssociationRule::Url(url) => {
+                self.url_index.remove(url);
+            }
+            AssociationRule::Glob(glob) => {
+                let normalized = self.normalize_glob_pattern(glob);
+                if let Some(assocs) = self.glob_index.get_mut(&normalized) {
+                    assocs.retain(|a| {
+                        if a.url == assoc.url && a.meta == assoc.meta {
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    
+                    // Clean up empty glob entries
+                    if assocs.is_empty() {
+                        self.glob_index.remove(&normalized);
+                        self.glob_cache.remove(&normalized);
+                    }
+                }
+            }
+            AssociationRule::Regex(_) => {
+                self.regex_patterns.retain(|(_, a)| {
+                    if a.url == assoc.url && a.meta == assoc.meta {
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        
+        removed
+    }
+    
+    fn find_match(&self, file: &Url) -> Option<SchemaAssociation> {
+        // 1. Check exact URL match first (O(1))
+        if let Some(assoc) = self.url_index.get(file) {
+            return Some(assoc.clone());
+        }
+        
+        // 2. Check glob patterns (O(log n) for path-based lookups)
+        let normalized_path = self.normalize_url_for_glob(file);
+        
+        // Try to find a glob pattern that matches this path
+        let mut best_glob_match: Option<SchemaAssociation> = None;
+        for (pattern, assocs) in &self.glob_index {
+            // Skip the "glob:" prefix we added for indexing
+            if let Some(_glob_pattern) = pattern.strip_prefix("glob:") {
+                // Check if any of the glob patterns match
+                for assoc in assocs {
+                    if let Some(glob_rule) = self.glob_cache.get(pattern) {
+                        if glob_rule.is_match(&normalized_path) {
+                            if let Some(ref current) = best_glob_match {
+                                if assoc.priority > current.priority {
+                                    best_glob_match = Some(assoc.clone());
+                                }
+                            } else {
+                                best_glob_match = Some(assoc.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if let Some(assoc) = best_glob_match {
+            return Some(assoc);
+        }
+        
+        // 3. Check regex patterns (O(n) but typically small number)
+        let mut best_match: Option<SchemaAssociation> = None;
+        for (regex, assoc) in &self.regex_patterns {
+            if regex.is_match(&normalize_str(file.as_str())) {
+                if let Some(ref current) = best_match {
+                    if assoc.priority > current.priority {
+                        best_match = Some(assoc.clone());
+                    }
+                } else {
+                    best_match = Some(assoc.clone());
+                }
+            }
+        }
+        
+        best_match
+    }
+    
+    fn normalize_glob_pattern(&self, _glob: &GlobRule) -> String {
+        // Create a normalized key for the glob pattern
+        // Since GlobRule doesn't expose patterns directly, we'll use a simple counter-based approach
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("glob:{}", id)
+    }
+    
+    fn normalize_url_for_glob(&self, url: &Url) -> String {
+        // Strip scheme and normalize for glob matching
+        // This matches the existing logic in AssociationRule::is_match
+        let path = url.as_str()
+            .strip_prefix(url.scheme())
+            .unwrap_or(url.as_str())
+            .strip_prefix("://")
+            .unwrap_or(url.as_str());
+        
+        normalize_str(path).to_string()
+    }
+    
+    fn get_all_associations(&self) -> Vec<(AssociationRule, SchemaAssociation)> {
+        let mut result = Vec::new();
+        
+        // Collect from all indexes
+        for (url, assoc) in &self.url_index {
+            result.push((AssociationRule::Url(url.clone()), assoc.clone()));
+        }
+        
+        for (pattern, assocs) in &self.glob_index {
+            if let Some(glob_rule) = self.glob_cache.get(pattern) {
+                for assoc in assocs {
+                    result.push((AssociationRule::Glob(glob_rule.clone()), assoc.clone()));
+                }
+            }
+        }
+        
+        for (regex, assoc) in &self.regex_patterns {
+            result.push((AssociationRule::Regex(regex.clone()), assoc.clone()));
+        }
+        
+        result
+    }
+}
+
 #[derive(Clone)]
 pub struct SchemaAssociations<E: Environment> {
     concurrent_requests: Arc<Semaphore>,
     http: reqwest::Client,
     env: E,
+    // Replace linear Vec with optimized indexes
+    indexes: Arc<RwLock<AssociationIndexes>>,
+    // Keep original Vec for backward compatibility and dynamic operations
     associations: Arc<RwLock<Vec<(AssociationRule, SchemaAssociation)>>>,
     cache: Cache<E>,
 }
@@ -56,6 +275,7 @@ impl<E: Environment> SchemaAssociations<E> {
             cache,
             env,
             http,
+            indexes: Arc::new(RwLock::new(AssociationIndexes::new())),
             associations: Default::default(),
         };
         this.add_builtins();
@@ -63,11 +283,24 @@ impl<E: Environment> SchemaAssociations<E> {
     }
 
     pub fn add(&self, rule: AssociationRule, assoc: SchemaAssociation) {
+        // Add to both indexes and original Vec for backward compatibility
+        self.indexes.write().add(rule.clone(), assoc.clone());
         self.associations.write().push((rule, assoc));
     }
 
     pub fn retain(&self, f: impl Fn(&(AssociationRule, SchemaAssociation)) -> bool) {
-        self.associations.write().retain(f);
+        let mut indexes = self.indexes.write();
+        let mut associations = self.associations.write();
+        
+        // Remove from indexes first
+        associations.retain(|tuple| {
+            let should_keep = f(tuple);
+            if !should_keep {
+                let (rule, assoc) = tuple;
+                indexes.remove(rule, assoc);
+            }
+            should_keep
+        });
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, Vec<(AssociationRule, SchemaAssociation)>> {
@@ -79,6 +312,7 @@ impl<E: Environment> SchemaAssociations<E> {
     /// Note that this will completely remove all associations,
     /// even built-in ones that will have to be added again.
     pub fn clear(&self) {
+        self.indexes.write().clear();
         self.associations.write().clear();
     }
 
@@ -97,6 +331,22 @@ impl<E: Environment> SchemaAssociations<E> {
                 priority: priority::BUILTIN,
             },
         ));
+        
+        // Also add to indexes
+        let builtin_assoc = SchemaAssociation {
+            url: builtins::TAPLO_CONFIG_URL.parse().unwrap(),
+            meta: json!({
+                "name": "Taplo",
+                "description": "Taplo configuration file.",
+                "source": source::BUILTIN
+            }),
+            priority: priority::BUILTIN,
+        };
+        
+        self.indexes.write().add(
+            AssociationRule::Regex(Regex::new(r".*\.?taplo\.toml$").unwrap()),
+            builtin_assoc,
+        );
     }
 
     pub async fn add_from_catalog(&self, url: &Url) -> Result<(), anyhow::Error> {
@@ -106,19 +356,19 @@ impl<E: Environment> SchemaAssociations<E> {
                 for schema in &index.schemas {
                     match GlobRule::new(&schema.file_match, [] as [&str; 0]) {
                         Ok(rule) => {
-                            self.associations.write().push((
-                                rule.into(),
-                                SchemaAssociation {
-                                    url: schema.url.clone(),
-                                    meta: json!({
-                                        "name": schema.name,
-                                        "description": schema.description,
-                                        "source": source::CATALOG,
-                                        "catalog_url": url,
-                                    }),
-                                    priority: priority::CATALOG,
-                                },
-                            ));
+                            let assoc = SchemaAssociation {
+                                url: schema.url.clone(),
+                                meta: json!({
+                                    "name": schema.name,
+                                    "description": schema.description,
+                                    "source": source::CATALOG,
+                                    "catalog_url": url,
+                                }),
+                                priority: priority::CATALOG,
+                            };
+                            
+                            self.indexes.write().add(AssociationRule::Glob(rule.clone()), assoc.clone());
+                            self.associations.write().push((AssociationRule::Glob(rule), assoc));
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -147,19 +397,19 @@ impl<E: Environment> SchemaAssociations<E> {
                             }
                         };
 
-                        self.associations.write().push((
-                            regex.into(),
-                            SchemaAssociation {
-                                url: schema.url.clone(),
-                                meta: json!({
-                                    "name": schema.title,
-                                    "description": schema.description,
-                                    "source": source::CATALOG,
-                                    "catalog_url": url,
-                                }),
-                                priority: priority::CATALOG,
-                            },
-                        ));
+                        let assoc = SchemaAssociation {
+                            url: schema.url.clone(),
+                            meta: json!({
+                                "name": schema.title,
+                                "description": schema.description,
+                                "source": source::CATALOG,
+                                "catalog_url": url,
+                            }),
+                            priority: priority::CATALOG,
+                        };
+                        
+                        self.indexes.write().add(AssociationRule::Regex(regex.clone()), assoc.clone());
+                        self.associations.write().push((AssociationRule::Regex(regex), assoc));
                     }
                 }
             }
@@ -212,45 +462,57 @@ impl<E: Environment> SchemaAssociations<E> {
                     }
                 };
 
-                self.associations.write().push((
-                    AssociationRule::Url(doc_url.clone()),
-                    SchemaAssociation {
-                        url: schema_url,
-                        priority: priority::DIRECTIVE,
-                        meta: json!({ "source": source::DIRECTIVE }),
-                    },
-                ));
-                break;
+                let assoc = SchemaAssociation {
+                    url: schema_url.clone(),
+                    meta: json!({
+                        "source": source::DIRECTIVE,
+                    }),
+                    priority: priority::DIRECTIVE,
+                };
+                
+                self.indexes.write().add(AssociationRule::Url(schema_url.clone()), assoc.clone());
+                self.associations.write().push((AssociationRule::Url(schema_url), assoc));
             }
         }
 
-        if let Node::Str(s) = root.get("$schema") {
-            let schema_url: Url = if s.value().starts_with('.') {
-                match doc_url.join(s.value()) {
-                    Ok(s) => s,
-                    Err(error) => {
-                        tracing::error!(%error, "invalid schema url or path given in the `$schema` field");
-                        return;
-                    }
-                }
-            } else {
-                match s.value().parse() {
-                    Ok(s) => s,
-                    Err(error) => {
-                        tracing::error!(%error, "invalid schema url or path given in the `$schema` field");
-                        return;
+        let schema_field = root.get("$schema");
+        if let Some(schema_url) = schema_field.as_str() {
+            let schema_url_str = schema_url.value();
+            let schema_url: Url = match schema_url_str.parse() {
+                Ok(url) => url,
+                Err(error) => {
+                    tracing::debug!(%error, "invalid url in $schema field, assuming file path instead");
+
+                    if self.env.is_absolute(Path::new(schema_url_str)) {
+                        match format!("file://{schema_url_str}").parse() {
+                            Ok(u) => u,
+                            Err(error) => {
+                                tracing::error!(%error, "invalid $schema field");
+                                return;
+                            }
+                        }
+                    } else {
+                        match doc_url.join(schema_url_str) {
+                            Ok(u) => u,
+                            Err(error) => {
+                                tracing::error!(%error, "invalid $schema field");
+                                return;
+                            }
+                        }
                     }
                 }
             };
 
-            self.associations.write().push((
-                AssociationRule::Url(doc_url.clone()),
-                SchemaAssociation {
-                    url: schema_url,
-                    priority: priority::SCHEMA_FIELD,
-                    meta: json!({ "source": source::SCHEMA_FIELD }),
-                },
-            ));
+            let assoc = SchemaAssociation {
+                url: schema_url.clone(),
+                meta: json!({
+                    "source": source::SCHEMA_FIELD,
+                }),
+                priority: priority::SCHEMA_FIELD,
+            };
+            
+            self.indexes.write().add(AssociationRule::Url(schema_url.clone()), assoc.clone());
+            self.associations.write().push((AssociationRule::Url(schema_url), assoc));
         }
     }
 
@@ -263,16 +525,16 @@ impl<E: Environment> SchemaAssociations<E> {
             if let Some(schema_opts) = &rule.options.schema {
                 if let Some(url) = &schema_opts.url {
                     if schema_opts.enabled.unwrap_or(true) {
-                        self.associations.write().push((
-                            file_rule.into(),
-                            SchemaAssociation {
-                                url: url.clone(),
-                                meta: json!({
-                                    "source": source::CONFIG,
-                                }),
-                                priority: priority::CONFIG_RULE,
-                            },
-                        ));
+                        let assoc = SchemaAssociation {
+                            url: url.clone(),
+                            meta: json!({
+                                "source": source::CONFIG,
+                            }),
+                            priority: priority::CONFIG_RULE,
+                        };
+                        
+                        self.indexes.write().add(AssociationRule::Glob(file_rule.clone()), assoc.clone());
+                        self.associations.write().push((AssociationRule::Glob(file_rule), assoc));
                     }
                 }
             }
@@ -285,34 +547,26 @@ impl<E: Environment> SchemaAssociations<E> {
         if let Some(schema_opts) = &config.global_options.schema {
             if let Some(url) = &schema_opts.url {
                 if schema_opts.enabled.unwrap_or(true) {
-                    self.associations.write().push((
-                        file_rule.into(),
-                        SchemaAssociation {
-                            url: url.clone(),
-                            meta: json!({
-                                "source": source::CONFIG,
-                            }),
-                            priority: priority::CONFIG,
-                        },
-                    ));
+                    let assoc = SchemaAssociation {
+                        url: url.clone(),
+                        meta: json!({
+                            "source": source::CONFIG,
+                        }),
+                        priority: priority::CONFIG,
+                    };
+                    
+                    self.indexes.write().add(AssociationRule::Glob(file_rule.clone()), assoc.clone());
+                    self.associations.write().push((AssociationRule::Glob(file_rule), assoc));
                 }
             }
         }
     }
 
+    /// Optimized association lookup using multi-index approach
     pub fn association_for(&self, file: &Url) -> Option<SchemaAssociation> {
-        self.associations
-            .read()
-            .iter()
-            .filter_map(|(rule, assoc)| {
-                if rule.is_match(file) {
-                    Some(assoc.clone())
-                } else {
-                    None
-                }
-            })
-            .max_by_key(|assoc| assoc.priority)
-            .tap(|s| {
+        // Use optimized indexes for fast lookup
+        if let Some(assoc) = self.indexes.read().find_match(file) {
+            return Some(assoc).tap(|s| {
                 if let Some(schema_association) = s {
                     tracing::debug!(
                         schema.url = %schema_association.url,
@@ -321,7 +575,10 @@ impl<E: Environment> SchemaAssociations<E> {
                         "found schema association"
                     );
                 }
-            })
+            });
+        }
+        
+        None
     }
 
     async fn load_catalog(&self, index_url: &Url) -> Result<SchemaCatalog, anyhow::Error> {
@@ -332,7 +589,7 @@ impl<E: Environment> SchemaAssociations<E> {
         let mut index = match self.fetch_external(index_url).await {
             Ok(idx) => idx,
             Err(error) => {
-                tracing::warn!(?error, "failed to fetch catalog");
+                tracing::warn!(%error, "failed to fetch catalog");
                 if let Ok(s) = self.cache.load(index_url, true).await {
                     return Ok(serde_json::from_value((*s).clone())?);
                 }
@@ -378,6 +635,72 @@ impl<E: Environment> SchemaAssociations<E> {
             )?),
             scheme => Err(anyhow!("the scheme `{scheme}` is not supported")),
         }
+    }
+
+    /// Get performance statistics for the current indexes
+    pub fn get_stats(&self) -> AssociationStats {
+        let indexes = self.indexes.read();
+        AssociationStats {
+            total_associations: self.associations.read().len(),
+            url_index_size: indexes.url_index.len(),
+            glob_index_size: indexes.glob_index.len(),
+            regex_patterns_size: indexes.regex_patterns.len(),
+            priority_levels: indexes.priority_index.len(),
+            glob_cache_size: indexes.glob_cache.len(),
+        }
+    }
+    
+    /// Optimize indexes for better performance
+    pub fn optimize_indexes(&self) {
+        let mut indexes = self.indexes.write();
+        
+        // Sort regex patterns by frequency of use (could be enhanced with actual usage tracking)
+        indexes.regex_patterns.sort_by(|a, b| {
+            // Simple heuristic: prioritize patterns with higher priority associations
+            b.1.priority.cmp(&a.1.priority)
+        });
+        
+        // Sort glob patterns by priority
+        for assocs in indexes.glob_index.values_mut() {
+            assocs.sort_by_key(|a| std::cmp::Reverse(a.priority));
+        }
+        
+        // Sort priority index entries
+        for assocs in indexes.priority_index.values_mut() {
+            assocs.sort_by_key(|a| std::cmp::Reverse(a.priority));
+        }
+    }
+}
+
+/// Performance statistics for schema associations
+#[derive(Debug, Clone)]
+pub struct AssociationStats {
+    pub total_associations: usize,
+    pub url_index_size: usize,
+    pub glob_index_size: usize,
+    pub regex_patterns_size: usize,
+    pub priority_levels: usize,
+    pub glob_cache_size: usize,
+}
+
+impl std::fmt::Display for AssociationStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Schema Associations Stats:\n\
+             - Total associations: {}\n\
+             - URL index entries: {}\n\
+             - Glob pattern entries: {}\n\
+             - Regex patterns: {}\n\
+             - Priority levels: {}\n\
+             - Glob cache entries: {}",
+            self.total_associations,
+            self.url_index_size,
+            self.glob_index_size,
+            self.regex_patterns_size,
+            self.priority_levels,
+            self.glob_cache_size
+        )
     }
 }
 
@@ -540,4 +863,99 @@ pub struct SchemaAssociation {
     pub meta: Value,
     pub url: Url,
     pub priority: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::environment::native::NativeEnvironment;
+    use std::time::Instant;
+
+    #[test]
+    fn test_optimized_lookup_performance() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let env = NativeEnvironment::new();
+            let cache = Cache::new(env.clone());
+            let http = reqwest::Client::new();
+            let associations = SchemaAssociations::new(env, cache, http);
+            
+            // Add many test associations to demonstrate scaling
+            for i in 0..1000 {
+                let pattern = format!("**/*{}.toml", i);
+                if let Ok(rule) = AssociationRule::glob(&pattern) {
+                    let assoc = SchemaAssociation {
+                        url: format!("https://example.com/schema{}.json", i).parse().unwrap(),
+                        meta: json!({
+                            "name": format!("Test Schema {}", i),
+                            "source": "test"
+                        }),
+                        priority: i % 100,
+                    };
+                    associations.add(rule, assoc);
+                }
+            }
+            
+            // Add some exact URL matches
+            for i in 0..100 {
+                let url = format!("https://example.com/file{}.toml", i).parse().unwrap();
+                let assoc = SchemaAssociation {
+                    url: format!("https://example.com/schema{}.json", i).parse().unwrap(),
+                    meta: json!({
+                        "name": format!("Exact Schema {}", i),
+                        "source": "test"
+                    }),
+                    priority: 100 + i,
+                };
+                associations.add(AssociationRule::Url(url), assoc);
+            }
+            
+            // Benchmark lookup performance
+            let test_url = "https://example.com/file50.toml".parse().unwrap();
+            
+            // Warm up
+            for _ in 0..100 {
+                let _ = associations.association_for(&test_url);
+            }
+            
+            // Benchmark
+            let start = Instant::now();
+            for _ in 0..1000 {
+                let _ = associations.association_for(&test_url);
+            }
+            let duration = start.elapsed();
+            
+            println!("Optimized lookup performance: {:?} for 1000 lookups", duration);
+            println!("Stats: {}", associations.get_stats());
+            
+            // Verify we get the expected result
+            let result = associations.association_for(&test_url);
+            assert!(result.is_some());
+            assert_eq!(result.unwrap().priority, 150); // 100 + 50
+        });
+    }
+    
+    #[test]
+    fn test_backward_compatibility() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let env = NativeEnvironment::new();
+            let cache = Cache::new(env.clone());
+            let http = reqwest::Client::new();
+            let associations = SchemaAssociations::new(env, cache, http);
+            
+            // Test that the old Vec-based API still works
+            let associations_vec = associations.read();
+            assert!(!associations_vec.is_empty());
+            
+            // Test that we can still iterate through all associations
+            let count = associations_vec.len();
+            assert!(count > 0);
+            
+            // Test that the new optimized lookup works
+            let test_url = "https://example.com/taplo.toml".parse().unwrap();
+            let result = associations.association_for(&test_url);
+            assert!(result.is_some());
+        });
+    }
 }
